@@ -162,7 +162,6 @@ class GitAuthHelper {
         this.sshKeyPath = '';
         this.sshKnownHostsPath = '';
         this.temporaryHomePath = '';
-        this.credentialsConfigPath = ''; // Path to separate credentials config file in RUNNER_TEMP
         this.git = gitCommandManager;
         this.settings = gitSourceSettings || {};
         // Token auth header
@@ -230,17 +229,15 @@ class GitAuthHelper {
     configureGlobalAuth() {
         return __awaiter(this, void 0, void 0, function* () {
             // 'configureTempGlobalConfig' noops if already set, just returns the path
-            yield this.configureTempGlobalConfig();
+            const newGitConfigPath = yield this.configureTempGlobalConfig();
             try {
                 // Configure the token
-                yield this.configureToken(true);
+                yield this.configureToken(newGitConfigPath, true);
                 // Configure HTTPS instead of SSH
                 yield this.git.tryConfigUnset(this.insteadOfKey, true);
                 if (!this.settings.sshKey) {
                     for (const insteadOfValue of this.insteadOfValues) {
-                        yield this.git.config(this.insteadOfKey, insteadOfValue, true, // globalConfig?
-                        true // add?
-                        );
+                        yield this.git.config(this.insteadOfKey, insteadOfValue, true, true);
                     }
                 }
             }
@@ -255,34 +252,19 @@ class GitAuthHelper {
     configureSubmoduleAuth() {
         return __awaiter(this, void 0, void 0, function* () {
             // Remove possible previous HTTPS instead of SSH
-            yield this.removeSubmoduleGitConfig(this.insteadOfKey);
+            yield this.removeGitConfig(this.insteadOfKey, true);
             if (this.settings.persistCredentials) {
-                // Get the credentials config file path in RUNNER_TEMP
-                const credentialsConfigPath = this.getCredentialsConfigPath();
-                // Container credentials config path
-                const containerCredentialsPath = path.posix.join('/github/runner_temp', path.basename(credentialsConfigPath));
-                // Get submodule config file paths.
-                const configPaths = yield this.git.getSubmoduleConfigPaths(this.settings.nestedSubmodules);
-                // For each submodule, configure includeIf entries pointing to the shared credentials file.
-                // Configure both host and container paths to support Docker container actions.
+                // Configure a placeholder value. This approach avoids the credential being captured
+                // by process creation audit events, which are commonly logged. For more information,
+                // refer to https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/component-updates/command-line-process-auditing
+                const output = yield this.git.submoduleForeach(
+                // wrap the pipeline in quotes to make sure it's handled properly by submoduleForeach, rather than just the first part of the pipeline
+                `sh -c "git config --local '${this.tokenConfigKey}' '${this.tokenPlaceholderConfigValue}' && git config --local --show-origin --name-only --get-regexp remote.origin.url"`, this.settings.nestedSubmodules);
+                // Replace the placeholder
+                const configPaths = output.match(/(?<=(^|\n)file:)[^\t]+(?=\tremote\.origin\.url)/g) || [];
                 for (const configPath of configPaths) {
-                    // Submodule Git directory
-                    let submoduleGitDir = path.dirname(configPath); // The config file is at .git/modules/submodule-name/config
-                    submoduleGitDir = submoduleGitDir.replace(/\\/g, '/'); // Use forward slashes, even on Windows
-                    // Configure host includeIf
-                    yield this.git.config(`includeIf.gitdir:${submoduleGitDir}.path`, credentialsConfigPath, false, // globalConfig?
-                    false, // add?
-                    configPath);
-                    // Container submodule git directory
-                    const githubWorkspace = process.env['GITHUB_WORKSPACE'];
-                    assert.ok(githubWorkspace, 'GITHUB_WORKSPACE is not defined');
-                    let relativeSubmoduleGitDir = path.relative(githubWorkspace, submoduleGitDir);
-                    relativeSubmoduleGitDir = relativeSubmoduleGitDir.replace(/\\/g, '/'); // Use forward slashes, even on Windows
-                    const containerSubmoduleGitDir = path.posix.join('/github/workspace', relativeSubmoduleGitDir);
-                    // Configure container includeIf
-                    yield this.git.config(`includeIf.gitdir:${containerSubmoduleGitDir}.path`, containerCredentialsPath, false, // globalConfig?
-                    false, // add?
-                    configPath);
+                    core.debug(`Replacing token placeholder in '${configPath}'`);
+                    yield this.replaceTokenPlaceholder(configPath);
                 }
                 if (this.settings.sshKey) {
                     // Configure core.sshCommand
@@ -313,10 +295,6 @@ class GitAuthHelper {
             }
         });
     }
-    /**
-     * Configures SSH authentication by writing the SSH key and known hosts,
-     * and setting up the GIT_SSH_COMMAND environment variable.
-     */
     configureSsh() {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.settings.sshKey) {
@@ -373,94 +351,43 @@ class GitAuthHelper {
             }
         });
     }
-    /**
-     * Configures token-based authentication by creating a credentials config file
-     * and setting up includeIf entries to reference it.
-     * @param globalConfig Whether to configure global config instead of local
-     */
-    configureToken(globalConfig) {
+    configureToken(configPath, globalConfig) {
         return __awaiter(this, void 0, void 0, function* () {
-            // Get the credentials config file path in RUNNER_TEMP
-            const credentialsConfigPath = this.getCredentialsConfigPath();
-            // Write placeholder to the separate credentials config file using git config.
-            // This approach avoids the credential being captured by process creation audit events,
-            // which are commonly logged. For more information, refer to
-            // https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/component-updates/command-line-process-auditing
-            yield this.git.config(this.tokenConfigKey, this.tokenPlaceholderConfigValue, false, // globalConfig?
-            false, // add?
-            credentialsConfigPath);
-            // Replace the placeholder in the credentials config file
-            let content = (yield fs.promises.readFile(credentialsConfigPath)).toString();
+            // Validate args
+            assert.ok((configPath && globalConfig) || (!configPath && !globalConfig), 'Unexpected configureToken parameter combinations');
+            // Default config path
+            if (!configPath && !globalConfig) {
+                configPath = path.join(this.git.getWorkingDirectory(), '.git', 'config');
+            }
+            // Configure a placeholder value. This approach avoids the credential being captured
+            // by process creation audit events, which are commonly logged. For more information,
+            // refer to https://docs.microsoft.com/en-us/windows-server/identity/ad-ds/manage/component-updates/command-line-process-auditing
+            yield this.git.config(this.tokenConfigKey, this.tokenPlaceholderConfigValue, globalConfig);
+            // Replace the placeholder
+            yield this.replaceTokenPlaceholder(configPath || '');
+        });
+    }
+    replaceTokenPlaceholder(configPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            assert.ok(configPath, 'configPath is not defined');
+            let content = (yield fs.promises.readFile(configPath)).toString();
             const placeholderIndex = content.indexOf(this.tokenPlaceholderConfigValue);
             if (placeholderIndex < 0 ||
                 placeholderIndex != content.lastIndexOf(this.tokenPlaceholderConfigValue)) {
-                throw new Error(`Unable to replace auth placeholder in ${credentialsConfigPath}`);
+                throw new Error(`Unable to replace auth placeholder in ${configPath}`);
             }
             assert.ok(this.tokenConfigValue, 'tokenConfigValue is not defined');
             content = content.replace(this.tokenPlaceholderConfigValue, this.tokenConfigValue);
-            yield fs.promises.writeFile(credentialsConfigPath, content);
-            // Add include or includeIf to reference the credentials config
-            if (globalConfig) {
-                // Global config file is temporary
-                yield this.git.config('include.path', credentialsConfigPath, true // globalConfig?
-                );
-            }
-            else {
-                // Host git directory
-                let gitDir = path.join(this.git.getWorkingDirectory(), '.git');
-                gitDir = gitDir.replace(/\\/g, '/'); // Use forward slashes, even on Windows
-                // Configure host includeIf
-                const hostIncludeKey = `includeIf.gitdir:${gitDir}.path`;
-                yield this.git.config(hostIncludeKey, credentialsConfigPath);
-                // Configure host includeIf for worktrees
-                const hostWorktreeIncludeKey = `includeIf.gitdir:${gitDir}/worktrees/*.path`;
-                yield this.git.config(hostWorktreeIncludeKey, credentialsConfigPath);
-                // Container git directory
-                const workingDirectory = this.git.getWorkingDirectory();
-                const githubWorkspace = process.env['GITHUB_WORKSPACE'];
-                assert.ok(githubWorkspace, 'GITHUB_WORKSPACE is not defined');
-                let relativePath = path.relative(githubWorkspace, workingDirectory);
-                relativePath = relativePath.replace(/\\/g, '/'); // Use forward slashes, even on Windows
-                const containerGitDir = path.posix.join('/github/workspace', relativePath, '.git');
-                // Container credentials config path
-                const containerCredentialsPath = path.posix.join('/github/runner_temp', path.basename(credentialsConfigPath));
-                // Configure container includeIf
-                const containerIncludeKey = `includeIf.gitdir:${containerGitDir}.path`;
-                yield this.git.config(containerIncludeKey, containerCredentialsPath);
-                // Configure container includeIf for worktrees
-                const containerWorktreeIncludeKey = `includeIf.gitdir:${containerGitDir}/worktrees/*.path`;
-                yield this.git.config(containerWorktreeIncludeKey, containerCredentialsPath);
-            }
+            yield fs.promises.writeFile(configPath, content);
         });
     }
-    /**
-     * Gets or creates the path to the credentials config file in RUNNER_TEMP.
-     * @returns The absolute path to the credentials config file
-     */
-    getCredentialsConfigPath() {
-        if (this.credentialsConfigPath) {
-            return this.credentialsConfigPath;
-        }
-        const runnerTemp = process.env['RUNNER_TEMP'] || '';
-        assert.ok(runnerTemp, 'RUNNER_TEMP is not defined');
-        // Create a unique filename for this checkout instance
-        const configFileName = `git-credentials-${(0, uuid_1.v4)()}.config`;
-        this.credentialsConfigPath = path.join(runnerTemp, configFileName);
-        core.debug(`Credentials config path: ${this.credentialsConfigPath}`);
-        return this.credentialsConfigPath;
-    }
-    /**
-     * Removes SSH authentication configuration by cleaning up SSH keys,
-     * known hosts files, and SSH command configurations.
-     */
     removeSsh() {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
+            var _a;
             // SSH key
             const keyPath = this.sshKeyPath || stateHelper.SshKeyPath;
             if (keyPath) {
                 try {
-                    core.info(`Removing SSH key '${keyPath}'`);
                     yield io.rmRF(keyPath);
                 }
                 catch (err) {
@@ -472,135 +399,36 @@ class GitAuthHelper {
             const knownHostsPath = this.sshKnownHostsPath || stateHelper.SshKnownHostsPath;
             if (knownHostsPath) {
                 try {
-                    core.info(`Removing SSH known hosts '${knownHostsPath}'`);
                     yield io.rmRF(knownHostsPath);
                 }
-                catch (err) {
-                    core.debug(`${(_b = err === null || err === void 0 ? void 0 : err.message) !== null && _b !== void 0 ? _b : err}`);
-                    core.warning(`Failed to remove SSH known hosts '${knownHostsPath}'`);
+                catch (_b) {
+                    // Intentionally empty
                 }
             }
             // SSH command
-            core.info('Removing SSH command configuration');
             yield this.removeGitConfig(SSH_COMMAND_KEY);
-            yield this.removeSubmoduleGitConfig(SSH_COMMAND_KEY);
         });
     }
-    /**
-     * Removes token-based authentication by cleaning up HTTP headers,
-     * includeIf entries, and credentials config files.
-     */
     removeToken() {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            // Remove HTTP extra header
-            core.info('Removing HTTP extra header');
+            // HTTP extra header
             yield this.removeGitConfig(this.tokenConfigKey);
-            yield this.removeSubmoduleGitConfig(this.tokenConfigKey);
-            // Collect credentials config paths that need to be removed
-            const credentialsPaths = new Set();
-            // Remove includeIf entries that point to git-credentials-*.config files
-            core.info('Removing includeIf entries pointing to credentials config files');
-            const mainCredentialsPaths = yield this.removeIncludeIfCredentials();
-            mainCredentialsPaths.forEach(path => credentialsPaths.add(path));
-            // Remove submodule includeIf entries that point to git-credentials-*.config files
-            const submoduleConfigPaths = yield this.git.getSubmoduleConfigPaths(true);
-            for (const configPath of submoduleConfigPaths) {
-                const submoduleCredentialsPaths = yield this.removeIncludeIfCredentials(configPath);
-                submoduleCredentialsPaths.forEach(path => credentialsPaths.add(path));
-            }
-            // Remove credentials config files
-            for (const credentialsPath of credentialsPaths) {
-                // Only remove credentials config files if they are under RUNNER_TEMP
-                const runnerTemp = process.env['RUNNER_TEMP'];
-                assert.ok(runnerTemp, 'RUNNER_TEMP is not defined');
-                if (credentialsPath.startsWith(runnerTemp)) {
-                    try {
-                        core.info(`Removing credentials config '${credentialsPath}'`);
-                        yield io.rmRF(credentialsPath);
-                    }
-                    catch (err) {
-                        core.debug(`${(_a = err === null || err === void 0 ? void 0 : err.message) !== null && _a !== void 0 ? _a : err}`);
-                        core.warning(`Failed to remove credentials config '${credentialsPath}'`);
-                    }
-                }
-                else {
-                    core.debug(`Skipping removal of credentials config '${credentialsPath}' - not under RUNNER_TEMP`);
-                }
-            }
         });
     }
-    /**
-     * Removes a git config key from the local repository config.
-     * @param configKey The git config key to remove
-     */
-    removeGitConfig(configKey) {
-        return __awaiter(this, void 0, void 0, function* () {
-            if ((yield this.git.configExists(configKey)) &&
-                !(yield this.git.tryConfigUnset(configKey))) {
-                // Load the config contents
-                core.warning(`Failed to remove '${configKey}' from the git config`);
+    removeGitConfig(configKey_1) {
+        return __awaiter(this, arguments, void 0, function* (configKey, submoduleOnly = false) {
+            if (!submoduleOnly) {
+                if ((yield this.git.configExists(configKey)) &&
+                    !(yield this.git.tryConfigUnset(configKey))) {
+                    // Load the config contents
+                    core.warning(`Failed to remove '${configKey}' from the git config`);
+                }
             }
-        });
-    }
-    /**
-     * Removes a git config key from all submodule configs.
-     * @param configKey The git config key to remove
-     */
-    removeSubmoduleGitConfig(configKey) {
-        return __awaiter(this, void 0, void 0, function* () {
             const pattern = regexpHelper.escape(configKey);
             yield this.git.submoduleForeach(
-            // Wrap the pipeline in quotes to make sure it's handled properly by submoduleForeach, rather than just the first part of the pipeline.
+            // wrap the pipeline in quotes to make sure it's handled properly by submoduleForeach, rather than just the first part of the pipeline
             `sh -c "git config --local --name-only --get-regexp '${pattern}' && git config --local --unset-all '${configKey}' || :"`, true);
         });
-    }
-    /**
-     * Removes includeIf entries that point to git-credentials-*.config files.
-     * @param configPath Optional path to a specific git config file to operate on
-     * @returns Array of unique credentials config file paths that were found and removed
-     */
-    removeIncludeIfCredentials(configPath) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const credentialsPaths = new Set();
-            try {
-                // Get all includeIf.gitdir keys
-                const keys = yield this.git.tryGetConfigKeys('^includeIf\\.gitdir:', false, // globalConfig?
-                configPath);
-                for (const key of keys) {
-                    // Get all values for this key
-                    const values = yield this.git.tryGetConfigValues(key, false, // globalConfig?
-                    configPath);
-                    if (values.length > 0) {
-                        // Remove only values that match git-credentials-<uuid>.config pattern
-                        for (const value of values) {
-                            if (this.testCredentialsConfigPath(value)) {
-                                credentialsPaths.add(value);
-                                yield this.git.tryConfigUnsetValue(key, value, false, configPath);
-                            }
-                        }
-                    }
-                }
-            }
-            catch (err) {
-                // Ignore errors - this is cleanup code
-                if (configPath) {
-                    core.debug(`Error during includeIf cleanup for ${configPath}: ${err}`);
-                }
-                else {
-                    core.debug(`Error during includeIf cleanup: ${err}`);
-                }
-            }
-            return Array.from(credentialsPaths);
-        });
-    }
-    /**
-     * Tests if a path matches the git-credentials-*.config pattern.
-     * @param path The path to test
-     * @returns True if the path matches the credentials config pattern
-     */
-    testCredentialsConfigPath(path) {
-        return /git-credentials-[0-9a-f-]+\.config$/i.test(path);
     }
 }
 
@@ -799,15 +627,9 @@ class GitCommandManager {
             yield this.execGit(args);
         });
     }
-    config(configKey, configValue, globalConfig, add, configFile) {
+    config(configKey, configValue, globalConfig, add) {
         return __awaiter(this, void 0, void 0, function* () {
-            const args = ['config'];
-            if (configFile) {
-                args.push('--file', configFile);
-            }
-            else {
-                args.push(globalConfig ? '--global' : '--local');
-            }
+            const args = ['config', globalConfig ? '--global' : '--local'];
             if (add) {
                 args.push('--add');
             }
@@ -882,16 +704,6 @@ class GitCommandManager {
                 }
             }
             throw new Error('Unexpected output when retrieving default branch');
-        });
-    }
-    getSubmoduleConfigPaths(recursive) {
-        return __awaiter(this, void 0, void 0, function* () {
-            // Get submodule config file paths.
-            // Use `--show-origin` to get the config file path for each submodule.
-            const output = yield this.submoduleForeach(`git config --local --show-origin --name-only --get-regexp remote.origin.url`, recursive);
-            // Extract config file paths from the output (lines starting with "file:").
-            const configPaths = output.match(/(?<=(^|\n)file:)[^\t]+(?=\tremote\.origin\.url)/g) || [];
-            return configPaths;
         });
     }
     getWorkingDirectory() {
@@ -1024,20 +836,6 @@ class GitCommandManager {
             return output.exitCode === 0;
         });
     }
-    tryConfigUnsetValue(configKey, configValue, globalConfig, configFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const args = ['config'];
-            if (configFile) {
-                args.push('--file', configFile);
-            }
-            else {
-                args.push(globalConfig ? '--global' : '--local');
-            }
-            args.push('--unset', configKey, configValue);
-            const output = yield this.execGit(args, true);
-            return output.exitCode === 0;
-        });
-    }
     tryDisableAutomaticGarbageCollection() {
         return __awaiter(this, void 0, void 0, function* () {
             const output = yield this.execGit(['config', '--local', 'gc.auto', '0'], true);
@@ -1055,46 +853,6 @@ class GitCommandManager {
                 return '';
             }
             return stdout;
-        });
-    }
-    tryGetConfigValues(configKey, globalConfig, configFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const args = ['config'];
-            if (configFile) {
-                args.push('--file', configFile);
-            }
-            else {
-                args.push(globalConfig ? '--global' : '--local');
-            }
-            args.push('--get-all', configKey);
-            const output = yield this.execGit(args, true);
-            if (output.exitCode !== 0) {
-                return [];
-            }
-            return output.stdout
-                .trim()
-                .split('\n')
-                .filter(value => value.trim());
-        });
-    }
-    tryGetConfigKeys(pattern, globalConfig, configFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const args = ['config'];
-            if (configFile) {
-                args.push('--file', configFile);
-            }
-            else {
-                args.push(globalConfig ? '--global' : '--local');
-            }
-            args.push('--name-only', '--get-regexp', pattern);
-            const output = yield this.execGit(args, true);
-            if (output.exitCode !== 0) {
-                return [];
-            }
-            return output.stdout
-                .trim()
-                .split('\n')
-                .filter(key => key.trim());
         });
     }
     tryReset() {
