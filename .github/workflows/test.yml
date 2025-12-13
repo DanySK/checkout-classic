@@ -344,3 +344,26 @@ jobs:
             echo "Expected commit to be 82f71901cf8c021332310dcc8cdba84c4193ff5d"
             exit 1
           fi
+
+  success:
+    needs:
+      - build
+      - test
+      - test-bypass-proxy
+      - test-git-container
+      - test-output
+      - test-proxy
+    permissions:
+      contents: write
+      deployments: write
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.1
+      - name: Install Semantic Release
+        run: npm install
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npx semantic-release

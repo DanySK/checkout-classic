@@ -36,6 +36,8 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@semantic-release/changelog": "6.0.3",
+    "@semantic-release/git": "10.0.1",
     "@types/jest": "^29.5.12",
     "@types/node": "^24.1.0",
     "@types/uuid": "^9.0.8",
@@ -51,5 +53,8 @@
     "prettier": "^3.3.3",
     "ts-jest": "^29.2.5",
     "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": "24.12"
   }
 }
