@@ -1,7 +1,7 @@
 {
-  "name": "checkout",
+  "name": "checkout-classic",
   "version": "5.0.0",
-  "description": "checkout action",
+  "description": "checkout action classic",
   "main": "lib/main.js",
   "scripts": {
     "build": "tsc && ncc build && node lib/misc/generate-docs.js",
@@ -14,7 +14,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/actions/checkout.git"
+    "url": "git+https://github.com/DanySK/checkout-classic.git"
   },
   "keywords": [
     "github",
