@@ -1,6 +1,5 @@
 {
   "name": "checkout-classic",
-  "version": "5.0.0",
   "description": "checkout action classic",
   "main": "lib/main.js",
   "scripts": {
